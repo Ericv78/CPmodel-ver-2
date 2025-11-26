@@ -18,6 +18,7 @@ PROBLEM DESCRIPTION:
     - Drone capacity limits (WD_max), truck carries items for drone delivery
     - Drone endurance constraint (E minutes max flight time)
     - Planning horizon limits total operation time (T minutes)
+    - Trucks can revisit the depot mid-mission to reload cargo
     - Objective: Minimize travel cost + delay penalties + unserved penalties
 
 DECISION VARIABLES:
@@ -56,49 +57,69 @@ SCALABLE: Start with N=1 tandem, easily scale to N>=2
 from ortools.sat.python import cp_model
 import numpy as np
 
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+except ImportError:  # Matplotlib not available in every runtime
+    plt = None
+    Line2D = None
+
 #-----------------------------------------------
 # Input Data
 #-----------------------------------------------
 # All node locations (depot + customers + rendezvous points)
 V = [
-    (0, 0),    # 0: depot
-    (15, 3),   # 1: customer node 1
-    (18, 7),   # 2: customer node 2
-    (4, 2),    # 3: customer node 3
-    (5, 4),    # 4: customer node 4
-    (8, 6),    # 5: customer node 5
-    (11, 1),   # 6: rendezvous point 1
-    (12, 2),   # 7: rendezvous point 2
-    (10, 3),   # 8: rendezvous point 3
+    (0, 0),      # 0: depot
+    (5, 2),      # 1: customer
+    (1, 7),      # 2: customer
+    (-5, 6),     # 3: customer
+    (-6, -2),    # 4: customer
+    (-1, -7),    # 5: customer
+    (6, -5),     # 6: customer
+    (7, 3),      # 7: customer
+    (-7, 1),     # 8: customer
+    (4, 1),      # 9: rendezvous point 1
+    (-3, 2),     # 10: rendezvous point 2
+    (-2, -3),    # 11: rendezvous point 3
+    (2, -3),     # 12: rendezvous point 4
+    (5, -2),     # 13: rendezvous point 5
 ]
 
 # Node type definitions (by index)
-VR_input = {6, 7, 8}  # Rendezvous-only nodes (truck can visit for drone operations only)
+VR_input = {9, 10, 11, 12, 13}
 
 #-----------------------------------------------
 # Demands (weights)
 #-----------------------------------------------
 w = [
-    0,   # 0: depot
-    3,   # 1: customer node 1
-    2,   # 2: customer node 2
-    1,   # 3: customer node 3
-    2,   # 4: customer node 4
-    3,   # 5: customer node 5
-    0,   # 6: rendezvous point 1 (no weight)
-    0,   # 7: rendezvous point 2 (no weight)
-    0,   # 8: rendezvous point 3 (no weight)
+    0,
+    3,
+    2,
+    1,
+    2,
+    3,
+    2,
+    4,
+    2,
+    0,
+    0,
+    0,
+    0,
+    0,
 ]
 
 #-----------------------------------------------
 # Deadlines
 #-----------------------------------------------
 D = {
-    1: 100,  
-    2: 110,  
-    3: 35,   
-    4: 45,
-    5: 60,
+    1: 110,
+    2: 120,
+    3: 95,
+    4: 85,
+    5: 75,
+    6: 100,
+    7: 115,
+    8: 105,
 }
 
 #-----------------------------------------------
@@ -106,10 +127,10 @@ D = {
 #-----------------------------------------------
 T = 100          # Planning horizon (minutes)
 E = 20           # Maximum drone endurance (battery life)
-N = 1           # Number of truck-drone tandems (start with 1, scalable)
+N = 3           # Number of truck-drone tandems (start with 1, scalable)
 depot = 0        # Depot location
 
-WT_max = 6     # Truck capacity
+WT_max = 3     # Truck capacity
 WD_max = 3       # Drone capacity
 ct = 0.8         # Truck cost per minute ($48/hour)
 cd = 1.5         # Drone cost per minute ($90/hour)
@@ -124,12 +145,14 @@ beta_value = 1000.0    # Penalty if unserved
 #-----------------------------------------------
 K = range(N)
 num_nodes = len(V)
-C = set(range(1, 6))          # Customer nodes (indices 1-5)
+C = set(range(1, 9))          # Customer nodes (1-8)
 VL = {depot}.union(VR_input)  # Launch nodes (only depot and rendezvous points)
-VR_rendezvous = VR_input      # Rendezvous node indices (from input)
-VR = VR_rendezvous            # Rendezvous nodes (use the rendezvous points)
-VT = set()                    # Truck-accessible customer nodes (empty - no direct truck deliveries)
-VD = C                        # All customer nodes served by drone only
+VR_rendezvous = VR_input
+VR = VR_rendezvous
+VT = set()
+VD = C
+# Allow trucks to leave/return to the depot multiple times for reload cycles.
+MAX_DEPOT_TRIPS = len(V)
 
 alpha = {i: alpha_value for i in C}
 beta = {i: beta_value for i in C}
@@ -218,6 +241,10 @@ truck_load = {}
 for k in K:
     for i in range(num_nodes):
         truck_load[k, i] = model.NewIntVar(0, WT_max, f"truck_load_{k}_{i}")
+
+# Truck usage indicator (1 if truck k leaves the depot)
+truck_active = {k: model.NewBoolVar(f"truck_active_{k}") for k in K}
+
 
 #-----------------------------------------------
 # Objective Function 
@@ -406,6 +433,46 @@ for k in K:
                     if (k, i, j, l) in y_drone:
                         model.Add(y_drone[k, i, j, l] == 0)
 
+# Truck flow conservation and depot return
+for k in K:
+    # Balance flows at the depot so a truck can depart-reload multiple times.
+    outgoing_from_depot = sum(
+        x[k, depot, j]
+        for j in range(num_nodes)
+        if j != depot and (k, depot, j) in x
+    )
+    incoming_to_depot = sum(
+        x[k, i, depot]
+        for i in range(num_nodes)
+        if i != depot and (k, i, depot) in x
+    )
+    model.Add(outgoing_from_depot == incoming_to_depot)
+    model.Add(outgoing_from_depot >= truck_active[k])
+    model.Add(outgoing_from_depot <= MAX_DEPOT_TRIPS * truck_active[k])
+
+    for node in VL:
+        if node == depot:
+            continue
+        incoming = sum(
+            x[k, i, node]
+            for i in range(num_nodes)
+            if i != node and (k, i, node) in x
+        )
+        outgoing = sum(
+            x[k, node, j]
+            for j in range(num_nodes)
+            if j != node and (k, node, j) in x
+        )
+        model.Add(incoming == outgoing)
+
+    # Any drone sortie requires the truck to be active
+    for i in VL:
+        for j in C:
+            for l in VR:
+                if (k, i, j, l) in y_drone:
+                    model.Add(truck_active[k] >= y_drone[k, i, j, l])
+
+
 # (62) Prevents trucks from launching drones that are still delivering
 # Ensures sequential operations - drone must complete before truck can launch another
 for k in K:
@@ -534,89 +601,303 @@ solver.parameters.num_search_workers = 8
 status = solver.Solve(model)
 
 #-----------------------------------------------
-# Solution Printer
+# Solution extraction and reporting helpers
 #-----------------------------------------------
-def print_solution(status):
-    print("\n" + "=" * 60)
-    print("SOLUTION")
-    print("=" * 60)
-    
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print(f"Status: {solver.StatusName(status)}")
-        print("No solution found.")
-        return
-    
-    print(f"Status: {solver.StatusName(status)}")
-    print(f"Total Objective: ${solver.ObjectiveValue():.2f}")
-    
-    # Calculate objective breakdown
+def collect_solution_data(status_code):
+    data = {
+        "status_code": status_code,
+        "status_name": solver.StatusName(status_code),
+    }
+
+    if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return data
+
     truck_cost_val = sum(t[i][j] * ct * solver.Value(x[k, i, j])
                          for k in K
                          for i in range(num_nodes)
                          for j in range(num_nodes) if i != j)
-    
+
     drone_cost_val = sum((t_prime[i][j] + t_prime[j][l]) * cd * solver.Value(y_drone[k, i, j, l])
                          for k in K
                          for i in VL for j in C for l in VR
                          if (k, i, j, l) in y_drone)
-    
+
     delay_penalty_val = sum(alpha[i] * solver.Value(delay[k, i]) for k in K for i in C)
-    
+
     unserved_penalty_val = sum(
         beta[i] * (1 - (sum(solver.Value(var) for var in truck_service_terms[i]) +
                         sum(solver.Value(var) for var in drone_service_terms[i])))
         for i in C
     )
-    
-    print(f"\n--- Objective Breakdown ---")
-    print(f"  Truck travel cost:  ${truck_cost_val:.2f}")
-    print(f"  Drone travel cost:  ${drone_cost_val:.2f}")
-    print(f"  Delay penalty:      ${delay_penalty_val:.2f}")
-    print(f"  Unserved penalty:   ${unserved_penalty_val:.2f}")
-    print(f"  {'─' * 40}")
-    print(f"  Total:              ${solver.ObjectiveValue():.2f}")
-    
-    print(f"\n--- Node Service Status ---")
+
+    node_service = {}
     for i in sorted(C):
         truck_served = sum(solver.Value(var) for var in truck_service_terms[i])
         drone_served = sum(solver.Value(var) for var in drone_service_terms[i])
-        served = truck_served + drone_served
-        
-        status_str = "✓ SERVED  " if served > 0 else "✗ UNSERVED"
-        service_type = "truck" if truck_served > 0 else ("drone" if drone_served > 0 else "none")
-        accessible = "truck-accessible" if i in VT else "drone-only"
         delay_val = solver.Value(delay[0, i]) if (0, i) in delay else 0
-        
-        print(f"  Node {i}: {status_str} | {service_type:5s} | weight: {w[i]:2d} | "
-              f"delay: {delay_val:3d}min | {accessible}")
-    
-    print(f"\n--- Drone Flights ---")
-    drone_flights = [(k, i, j, l) for (k, i, j, l) in y_drone.keys()
-                     if solver.Value(y_drone[k, i, j, l]) == 1]
-    
-    if drone_flights:
-        for k, i, j, l in drone_flights:
-            launch_t = solver.Value(a[k, i])
-            service_t = solver.Value(a_prime[k, j])
-            rend_t = solver.Value(a[k, l])
-            flight_time = t_prime[i][j] + t_prime[j][l]
-            print(f"  Tandem {k}: Launch={i} (t={launch_t}) → Serve={j} (t={service_t}) → "
-                  f"Rendezvous={l} (t={rend_t}) | Flight time: {flight_time}min")
-    else:
-        print("  None")
-    
-    print(f"\n--- Truck Arcs Used ---")
-    truck_arcs_found = False
+        node_service[i] = {
+            "truck_served": truck_served,
+            "drone_served": drone_served,
+            "delay": delay_val,
+            "accessible": "truck-accessible" if i in VT else "drone-only",
+        }
+
+    drone_flights = []
+    for (k, i, j, l), var in y_drone.items():
+        if solver.Value(var) == 1:
+            drone_flights.append({
+                "tandem": k,
+                "launch": i,
+                "customer": j,
+                "rendezvous": l,
+                "launch_time": solver.Value(a[k, i]),
+                "service_time": solver.Value(a_prime[k, j]),
+                "rendezvous_time": solver.Value(a[k, l]),
+                "flight_time": t_prime[i][j] + t_prime[j][l],
+            })
+
+    truck_arcs = {}
     for k in K:
         arcs = [(i, j) for i in range(num_nodes) for j in range(num_nodes)
                 if i != j and (k, i, j) in x and solver.Value(x[k, i, j]) == 1]
         if arcs:
-            truck_arcs_found = True
-            print(f"  Tandem {k}: {arcs}")
-    if not truck_arcs_found:
-        print("  None - No truck routing arcs active!")
-    
+            truck_arcs[k] = arcs
+
+    depot_departures = {
+        k: sum(
+            solver.Value(x[k, depot, j])
+            for j in range(num_nodes)
+            if j != depot and (k, depot, j) in x
+        )
+        for k in K
+    }
+    cargo_recharges = {k: max(0, departures - 1) for k, departures in depot_departures.items()}
+
+    truck_arrivals = {
+        k: {i: solver.Value(a[k, i]) for i in range(num_nodes)}
+        for k in K
+    }
+
+    drone_arrivals = {
+        k: {i: solver.Value(a_prime[k, i]) for i in range(num_nodes)}
+        for k in K
+    }
+
+    data.update({
+        "objective": solver.ObjectiveValue(),
+        "truck_cost": truck_cost_val,
+        "drone_cost": drone_cost_val,
+        "delay_penalty": delay_penalty_val,
+        "unserved_penalty": unserved_penalty_val,
+        "node_service": node_service,
+        "drone_flights": drone_flights,
+        "truck_arcs": truck_arcs,
+        "truck_arrivals": truck_arrivals,
+        "drone_arrivals": drone_arrivals,
+        "truck_active": {k: solver.Value(truck_active[k]) for k in K},
+        "cargo_recharges": cargo_recharges,
+        "depot_departures": depot_departures,
+    })
+
+    return data
+
+
+def print_solution(solution_data):
+    print("\n" + "=" * 60)
+    print("SOLUTION")
     print("=" * 60)
 
-print_solution(status)
+    status_code = solution_data["status_code"]
+    print(f"Status: {solution_data['status_name']}")
 
+    if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("No solution found.")
+        print("=" * 60)
+        return
+
+    print(f"Total Objective: ${solution_data['objective']:.2f}")
+
+    print(f"\n--- Objective Breakdown ---")
+    print(f"  Truck travel cost:  ${solution_data['truck_cost']:.2f}")
+    print(f"  Drone travel cost:  ${solution_data['drone_cost']:.2f}")
+    print(f"  Delay penalty:      ${solution_data['delay_penalty']:.2f}")
+    print(f"  Unserved penalty:   ${solution_data['unserved_penalty']:.2f}")
+    print(f"  {'─' * 40}")
+    print(f"  Total:              ${solution_data['objective']:.2f}")
+
+    print(f"\n--- Node Service Status ---")
+    for i in sorted(solution_data["node_service"].keys()):
+        node_info = solution_data["node_service"][i]
+        served = node_info["truck_served"] + node_info["drone_served"]
+        status_str = "✓ SERVED  " if served > 0 else "✗ UNSERVED"
+        if node_info["truck_served"]:
+            service_type = "truck"
+        elif node_info["drone_served"]:
+            service_type = "drone"
+        else:
+            service_type = "none"
+        print(f"  Node {i}: {status_str} | {service_type:5s} | weight: {w[i]:2d} | "
+              f"delay: {node_info['delay']:3d}min | {node_info['accessible']}")
+
+    print(f"\n--- Drone Flights ---")
+    if solution_data["drone_flights"]:
+        for flight in solution_data["drone_flights"]:
+            print(
+                f"  Tandem {flight['tandem']}: Launch={flight['launch']} (t={flight['launch_time']}) "
+                f"→ Serve={flight['customer']} (t={flight['service_time']}) "
+                f"→ Rendezvous={flight['rendezvous']} (t={flight['rendezvous_time']}) "
+                f"| Flight time: {flight['flight_time']}min"
+            )
+    else:
+        print("  None")
+
+    print(f"\n--- Truck Arcs Used ---")
+    if solution_data["truck_arcs"]:
+        for k, arcs in solution_data["truck_arcs"].items():
+            print(f"  Tandem {k}: {arcs}")
+    else:
+        print("  None - No truck routing arcs active!")
+
+    recharges = solution_data.get("cargo_recharges", {})
+    print(f"\n--- Depot Cargo Recharges ---")
+    if recharges:
+        for k in sorted(recharges.keys()):
+            label = "recharges" if recharges[k] != 1 else "recharge"
+            print(f"  Tandem {k}: {recharges[k]} {label}")
+    else:
+        print("  Not tracked")
+
+    print("=" * 60)
+
+
+def plot_solution(solution_data, show=True, save_path=None):
+    if plt is None:
+        print("Matplotlib is not installed; skipping visualization.")
+        return
+
+    if solution_data["status_code"] not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("No feasible solution to plot.")
+        return
+
+    def _palette_pair(index):
+        cmap = plt.colormaps.get_cmap("tab20")
+        colors = cmap.colors if hasattr(cmap, "colors") else cmap(np.linspace(0, 1, 20))
+        truck_color = colors[(2 * index) % len(colors)]
+        drone_color = colors[(2 * index + 1) % len(colors)]
+        return truck_color, drone_color
+
+    def _draw_base_nodes(ax):
+        coords = np.array(V)
+        ax.scatter(coords[depot, 0], coords[depot, 1], c="black", marker="s", s=120)
+        rendezvous_idx = sorted(VR)
+        if rendezvous_idx:
+            ax.scatter(coords[rendezvous_idx, 0], coords[rendezvous_idx, 1], c="black", marker="^", s=95)
+
+        served_idx = []
+        unserved_idx = []
+        for i in sorted(C):
+            node_info = solution_data["node_service"].get(i, {})
+            served = node_info.get("truck_served", 0) + node_info.get("drone_served", 0)
+            if served:
+                served_idx.append(i)
+            else:
+                unserved_idx.append(i)
+
+        if served_idx:
+            served_coords = coords[served_idx]
+            ax.scatter(served_coords[:, 0], served_coords[:, 1], c="tab:green", marker="o", s=75)
+        if unserved_idx:
+            unserved_coords = coords[unserved_idx]
+            ax.scatter(unserved_coords[:, 0], unserved_coords[:, 1], c="tab:red", marker="o", s=75)
+
+        for idx, (x_coord, y_coord) in enumerate(V):
+            ax.text(x_coord + 0.2, y_coord + 0.2, str(idx), fontsize=8)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, linestyle=":", linewidth=0.5)
+        ax.set_xlabel("X coordinate")
+        ax.set_ylabel("Y coordinate")
+
+    num_trucks = max(N, 1)
+    fig = plt.figure(figsize=(max(12, 4 * num_trucks), 8))
+    gs = fig.add_gridspec(2, num_trucks, height_ratios=[1, 1.1], hspace=0.3, wspace=0.25)
+
+    truck_axes = []
+    for col in range(num_trucks):
+        ax = fig.add_subplot(gs[0, col])
+        _draw_base_nodes(ax)
+        ax.set_title(f"Truck {col} arcs")
+        truck_axes.append(ax)
+
+    ax_drone = fig.add_subplot(gs[1, :])
+    _draw_base_nodes(ax_drone)
+    ax_drone.set_title("Drone arcs (all tandems)")
+
+    legend_handles = [
+        Line2D([], [], marker="s", color="none", markerfacecolor="black", markersize=8, label="Depot"),
+        Line2D([], [], marker="^", color="none", markerfacecolor="black", markersize=8, label="Rendezvous"),
+        Line2D([], [], marker="o", color="none", markerfacecolor="tab:green", markersize=8, label="Served customer"),
+        Line2D([], [], marker="o", color="none", markerfacecolor="tab:red", markersize=8, label="Unserved customer"),
+    ]
+
+    x_min = min(v[0] for v in V) - 1
+    x_max = max(v[0] for v in V) + 1
+    y_min = min(v[1] for v in V) - 1
+    y_max = max(v[1] for v in V) + 1
+
+    for ax in truck_axes:
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+    ax_drone.set_xlim(x_min, x_max)
+    ax_drone.set_ylim(y_min, y_max)
+
+    for k in range(N):
+        truck_color, drone_color = _palette_pair(k)
+        arcs = solution_data["truck_arcs"].get(k, [])
+        ax_truck_k = truck_axes[k]
+        if arcs:
+            for (i, j) in arcs:
+                xs = [V[i][0], V[j][0]]
+                ys = [V[i][1], V[j][1]]
+                ax_truck_k.plot(xs, ys, color=truck_color, linewidth=2.0, alpha=0.6)
+            legend_handles.append(Line2D([], [], color=truck_color, linewidth=2.0, label=f"Tandem {k}: truck"))
+
+        flights = [f for f in solution_data["drone_flights"] if f["tandem"] == k]
+        if flights:
+            for flight in flights:
+                launch = V[flight["launch"]]
+                customer = V[flight["customer"]]
+                rendezvous = V[flight["rendezvous"]]
+                ax_drone.plot([launch[0], customer[0]], [launch[1], customer[1]], color=drone_color,
+                              linewidth=2.2, alpha=0.7)
+                ax_drone.plot([customer[0], rendezvous[0]], [customer[1], rendezvous[1]], color=drone_color,
+                              linewidth=2.2, alpha=0.7)
+                ax_drone.annotate("", xy=rendezvous, xytext=customer,
+                                  arrowprops=dict(arrowstyle="->", color=drone_color, lw=0.9, alpha=0.6))
+                ax_drone.annotate("", xy=customer, xytext=launch,
+                                  arrowprops=dict(arrowstyle="->", color=drone_color, lw=0.9, alpha=0.6))
+            legend_handles.append(Line2D([], [], color=drone_color, linewidth=2.2, label=f"Tandem {k}: drone"))
+
+    fig.legend(handles=legend_handles, loc="lower left", ncol=1, fontsize=8, bbox_to_anchor=(0.02, 0.04))
+    fig.suptitle("Truck and Drone Routing Map", fontweight="bold", y=0.97)
+
+    fig.tight_layout(rect=[0.05, 0.08, 0.98, 0.96])
+
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def main(show_plot=True, save_path=None):
+    solution_data = collect_solution_data(status)
+    print_solution(solution_data)
+    if show_plot or save_path:
+        plot_solution(solution_data, show=show_plot, save_path=save_path)
+    return solution_data
+
+
+if __name__ == "__main__":
+    main(show_plot=True)
