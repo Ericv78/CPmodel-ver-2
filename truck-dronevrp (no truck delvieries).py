@@ -5,51 +5,44 @@ TRUCK-DRONE VRP WITH RENDEZVOUS - CP-SAT Implementation
 
 PURPOSE:
     Incremental implementation of truck-drone routing with rendezvous mechanics.
-    Focus on drone routing constraints with truck synchronization. Truck acts
-    as mobile depot - does NOT make direct customer deliveries, only supports
-    drone operations through launch and rendezvous coordination.
+    Focus on drone routing constraints with truck synchronization. The truck acts
+    strictly as a mobile depot — no direct customer deliveries — and exists only
+    to stage payloads, launch sorties, and pick up drones at rendezvous nodes.
+
+CURRENT SCENARIO:
+    - Single truck-drone tandem (N = 1) supporting seven customer nodes (1-7)
+    - Eight rendezvous-only nodes (8-15) provide enough launch/recovery slots
+    - Truck capacity WT_max = 360 kg, drone capacity WD_max = 120 kg
+    - Drone endurance E = 110 minutes and planning horizon T = 240 minutes
+    - Truck may loop back to the depot multiple times to reload payload
+    - All customers are drone-only due to damaged roads; trucks never visit them
 
 PROBLEM DESCRIPTION:
-    - Truck-drone tandems serve customer nodes from a central depot
-    - Trucks act as mobile launch platforms (no direct customer deliveries)
-    - Drones launch from truck, serve customer nodes, rendezvous with truck
-    - Truck travels between depot and rendezvous points to coordinate drone ops
-    - Each customer has demand (weight) and delivery deadline
-    - Drone capacity limits (WD_max), truck carries items for drone delivery
-    - Drone endurance constraint (E minutes max flight time)
-    - Planning horizon limits total operation time (T minutes)
-    - Trucks can revisit the depot mid-mission to reload cargo
-    - Objective: Minimize travel cost + delay penalties + unserved penalties
+    - Truck departs from depot, visits rendezvous nodes, and enables drone sorties
+    - Drone launches from the truck, serves exactly one customer, then rendezvous
+    - Each customer has weight demand and delivery deadline with lateness penalty
+    - Objective minimizes truck/drone travel costs plus delay and unserved penalties
 
 DECISION VARIABLES:
     - x[k,i,j]: Binary, truck k travels from node i to node j
     - y_drone[k,i,j,l]: Binary, drone k launches from i, serves j, rendezvous at l
     - a[k,i]: Integer, truck arrival time at node i
     - a_prime[k,i]: Integer, drone arrival time at node i
-    - delay[k,i]: Integer, delay at node i for tandem k (lateness beyond deadline)
-    - P[k,i,j]: Binary, sequencing variable for tour ordering
-    - truck_load[k,i]: Integer, truck load at node i
+    - delay[k,i]: Integer, lateness beyond deadline for node i
+    - P[k,i,j]: Binary sequencing helper enforcing sequential sorties
+    - truck_load[k,i]: Integer payload remaining on truck at node i
 
 KEY CONSTRAINTS:
-    (36) Each customer visited at most once
-    (40) Trucks cannot reach road-damaged areas (drone-only nodes)
-    (46-48) Drone launch/rendezvous uniqueness and node restrictions
-    (51-52) Initialize arrival times at depot
-    (55-60) Drone travel time continuity and synchronization
-    (61) Drone endurance limit
-    (62) Sequential drone operations (no concurrent flights per tandem)
-    (63) Delay calculation for deadline penalties
-    Additional: Truck capacity tracking, truck arc activation for cost
+    (36) Each customer serviced at most once
+    (40) Truck prohibited from customer nodes (drone-only service)
+    (46-50) Launch/rendezvous uniqueness and coupling with truck arcs
+    (51-60) Arrival time initialization plus truck-drone synchronization
+    (61) Drone endurance upper bound per sortie
+    (62) Sequential sortie enforcement (no overlapping flights per tandem)
+    Truck capacity tracking and depot reload logic keep payload feasible
 
-NODE STRUCTURE:
-    - Depot (0): Starting point for all tandems
-    - Customer nodes (1-5): Service locations requiring drone delivery
-    - Rendezvous nodes (6-8): Designated points for truck-drone coordination
-    - VL = {0, 6, 7, 8}: Valid launch nodes (depot + rendezvous points)
-    - VR = {6, 7, 8}: Valid rendezvous nodes (excluding depot)
-    - VD = {1, 2, 3, 4, 5}: Drone-accessible customers (all customers)
-
-SCALABLE: Start with N=1 tandem, easily scale to N>=2
+SCALABLE: Start with N=1 tandem, extend to multiple tandems or more rendezvous
+nodes as required by additional demand.
 
 ===============================================================================
 """
@@ -76,36 +69,40 @@ V = [
     (-6, -2),    # 4: customer
     (-1, -7),    # 5: customer
     (6, -5),     # 6: customer
-    (7, 3),      # 7: customer
-    (-7, 1),     # 8: customer
-    (4, 1),      # 9: rendezvous point 1
-    (-3, 2),     # 10: rendezvous point 2
-    (-2, -3),    # 11: rendezvous point 3
-    (2, -3),     # 12: rendezvous point 4
-    (5, -2),     # 13: rendezvous point 5
+    (-7, 1),     # 7: customer
+    (4, 1),      # 8: rendezvous point 1
+    (-3, 2),     # 9: rendezvous point 2
+    (-2, -3),    # 10: rendezvous point 3
+    (2, -3),     # 11: rendezvous point 4
+    (5, -2),     # 12: rendezvous point 5
+    (8, -1),     # 13: rendezvous point 6
+    (-4, -6),    # 14: rendezvous point 7
+    (0, 5),      # 15: rendezvous point 8
 ]
 
 # Node type definitions (by index)
-VR_input = {9, 10, 11, 12, 13}
+VR_input = {8, 9, 10, 11, 12, 13, 14, 15}
 
 #-----------------------------------------------
 # Demands (weights)
 #-----------------------------------------------
 w = [
-    0,
-    3,
-    2,
-    1,
-    2,
-    3,
-    2,
-    4,
-    2,
-    0,
-    0,
-    0,
-    0,
-    0,
+    0,    # 0: depot
+    80,   # 1: critical care kits
+    55,   # 2: vaccine cooler
+    25,   # 3: lab samples
+    40,   # 4: emergency shelter totes
+    65,   # 5: trauma supplies
+    45,   # 6: portable diagnostics
+    50,   # 7: cold-chain medications
+    0,    # 8: rendezvous point 1
+    0,    # 9: rendezvous point 2
+    0,    # 10: rendezvous point 3
+    0,    # 11: rendezvous point 4
+    0,    # 12: rendezvous point 5
+    0,    # 13: rendezvous point 6
+    0,    # 14: rendezvous point 7
+    0,    # 15: rendezvous point 8
 ]
 
 #-----------------------------------------------
@@ -118,34 +115,33 @@ D = {
     4: 85,
     5: 75,
     6: 100,
-    7: 115,
-    8: 105,
+    7: 105,
 }
 
 #-----------------------------------------------
 # Parameters
 #-----------------------------------------------
-T = 100          # Planning horizon (minutes)
-E = 20           # Maximum drone endurance (battery life)
-N = 3           # Number of truck-drone tandems (start with 1, scalable)
+T = 240          # Planning horizon (minutes)
+E = 110          # Maximum drone endurance (battery life)
+N = 1           # Number of truck-drone tandems
 depot = 0        # Depot location
 
-WT_max = 3     # Truck capacity
-WD_max = 3       # Drone capacity
-ct = 0.8         # Truck cost per minute ($48/hour)
-cd = 1.5         # Drone cost per minute ($90/hour)
-vt = 0.6         # Truck speed (36 km/h)
-vd = 0.6         # Drone speed (36 km/h)
+WT_max = 360      # Truck capacity (kg of payload staged for drones)
+WD_max = 120      # Drone capacity (kg)
+ct = 1.1          # Truck cost per minute (~$66/hour fully burdened)
+cd = 3.6          # Drone cost per minute (~$216/hour hybrid-eVTOL ops)
+vt = 0.4          # Truck speed (24 km/h in congested cores)
+vd = 2.2          # Drone speed (132 km/h cruise for hybrid-eVTOL)
 
-alpha_value = 8.0      # Cost per minute of delay
-beta_value = 1000.0    # Penalty if unserved
+alpha_value = 40.0     # Cost per minute of delay 
+beta_value = 5000.0    # Penalty if unserved
 
 #-----------------------------------------------
 # Derived Data
 #-----------------------------------------------
 K = range(N)
 num_nodes = len(V)
-C = set(range(1, 9))          # Customer nodes (1-8)
+C = set(range(1, 8))          # Customer nodes (1-7)
 VL = {depot}.union(VR_input)  # Launch nodes (only depot and rendezvous points)
 VR_rendezvous = VR_input
 VR = VR_rendezvous
