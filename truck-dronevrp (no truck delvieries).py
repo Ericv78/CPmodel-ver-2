@@ -88,13 +88,13 @@ VR_input = {8, 9, 10, 11, 12, 13, 14, 15}
 #-----------------------------------------------
 w = [
     0,    # 0: depot
-    80,   # 1: critical care kits
-    55,   # 2: vaccine cooler
-    25,   # 3: lab samples
-    40,   # 4: emergency shelter totes
-    65,   # 5: trauma supplies
-    45,   # 6: portable diagnostics
-    50,   # 7: cold-chain medications
+    80,   # 1
+    55,   # 2
+    25,   # 3
+    40,   # 4
+    65,   # 5
+    45,   # 6
+    50,   # 7
     0,    # 8: rendezvous point 1
     0,    # 9: rendezvous point 2
     0,    # 10: rendezvous point 3
@@ -897,3 +897,4 @@ def main(show_plot=True, save_path=None):
 
 if __name__ == "__main__":
     main(show_plot=True)
+
